@@ -116,40 +116,40 @@ void moveFootXYZ(uint8_t startID, float x, float y, float z, uint16_t time)
 
 void loop()
 {
-  // Try reaching backward and slightly down
-  // X=10 (reach), Y=5 (backward), Z=-8 (on the floor)
-  moveFootXYZ(0, 10, 8, -8, 500);
-  moveFootXYZ(9, 10, -8, -8, 500);
-  moveFootXYZ(29, 10, 8, -8, 500);
-  delay(1000);
-
   // Lift the leg up
-  moveFootXYZ(0, 10, 0, -12, 500);
+  moveFootXYZ(0, 10, 4, -12, 500);
+  moveFootXYZ(29, 10, -4, -12, 500);
   moveFootXYZ(9, 10, 0, -12, 500);
-  moveFootXYZ(29, 10, 0, -12, 500);
   delay(1000);
 
-  // X=10, Y=0(Straight), Z=-8 (on the floor )
-  moveFootXYZ(0, 10, 0, -8, 500);
-  moveFootXYZ(9, 10, 0, -8, 500);
+  // Position: X=10, Y=0(Straight), Z=-8 (on the floor )
+  moveFootXYZ(0, 10, 8, -8, 500);
   moveFootXYZ(29, 10, 0, -8, 500);
+  moveFootXYZ(9, 10, -4, -8, 500);
   delay(1000);
 
-  // X=10 (reach), Y=5 (backward), Z=-8 (on the floor)
-  moveFootXYZ(3, 10, 8, -8, 500);
-  moveFootXYZ(6, 10, -8, -8, 500);
-  moveFootXYZ(26, 10, -8, -8, 500);
+  // Try reaching backward and slightly down
+  // Drag: X=10 (reach), Y=5 (backward), Z=-8 (on the floor)
+  moveFootXYZ(0, 10, 0, -8, 500);
+  moveFootXYZ(29, 10, -8, -8, 500);
+  moveFootXYZ(9, 10, 4, -8, 500);
   delay(1000);
 
   // Lift the leg up
   moveFootXYZ(3, 10, 0, -12, 500);
-  moveFootXYZ(6, 10, 0, -12, 500);
-  moveFootXYZ(26, 10, 0, -12, 500);
+  moveFootXYZ(6, 10, -4, -12, 500);
+  moveFootXYZ(26, 10, 4, -12, 500);
   delay(1000);
 
   // X=10, Y=0(Straight), Z=-8 (on the floor )
-  moveFootXYZ(3, 10, 0, -8, 500);
-  moveFootXYZ(6, 10, 0, -8, 500);
+  moveFootXYZ(3, 10, 4, -8, 500);
+  moveFootXYZ(6, 10, -8, -8, 500);
   moveFootXYZ(26, 10, 0, -8, 500);
+  delay(1000);
+
+  // X=10 (reach), Y=5 (backward), Z=-8 (on the floor)
+  moveFootXYZ(3, 10, -4, -8, 500);
+  moveFootXYZ(6, 10, 0, -8, 500);
+  moveFootXYZ(26, 10, 8, -8, 500);
   delay(1000);
 }
