@@ -1,54 +1,53 @@
 /*===============================================================
- * SpiderBot V2.6  —  Final
+ * SpiderBot V2.7
  * Author  : Amit Parihar
  * Wiring  : UART2  RX=16  TX=17  →  LSC-32 servo controller
  *
  * ── WHAT'S IN THIS FILE ──────────────────────────────────────
  *   1. Hardware + Constants + Leg Data
  *   2. IK Solver       — foot XYZ → servo pulses
- *   3. Gait Shapes     — plug-and-play stride definitions
+ *   3. Gait Shapes     — plug-and-play stride definitions (2-D)
  *   4. Command Queue   — circular buffer, never drops a command
  *   5. Gait Engine     — millis()-driven, never blocks loop()
- *   6. Movement Funcs  — walkForward, turnLeft, rotateLeft, etc.
+ *   6. Movement Funcs  — walk, turn, rotate, crab directions
  *   7. Height Control  — raise / lower body at runtime
  *   8. Input Parser    — BT + Serial command handler
  *   9. setup() + loop()
  *
- * ── NEW IN V2.6 ──────────────────────────────────────────────
- *   - Zero delay() during movement — all phases are timed with
- *     millis() so loop() is always free to read new BT input.
- *   - Command queue — commands sent mid-step are saved and
- *     executed automatically when the current step finishes.
- *   - Smart differential drive mixing:
- *       finalScale = jFwd + (jTurn × coxaDir)
- *     One formula handles forward, backward, arc turns, and
- *     pure rotation — no separate gait indices needed.
- *   - Joystick command:
- *       j66,33  → 66 % forward  + 33 % left turn  (arc left)
- *       j0,50   → 0  % forward  + 50 % turn       (spin)
- *       j100,0  → full forward
- *     Speed is auto-scaled from the vector magnitude of the
- *     two joystick inputs.
- *   - Posture commands:  A = sit,  Z = sleep
- *
- * ── BT APP SETUP (Serial Bluetooth Terminal) ─────────────────
- *   Settings → Line ending → Newline (\n)
+ * ── WHAT'S NEW IN V2.7 vs V2.6 ──────────────────────────────
+ *   - Crab mode with a dedicated leg geometry (crabLegs[]).
+ *     The crab stance rotates legs to face sideways, so the
+ *     bot walks like a crab instead of a spider.
+ *   - 2-D gait engine: every gait now defines swingX/dragX in
+ *     addition to swingY/dragY.  Normal walk uses X=restX
+ *     (unchanged), crab left/right drives the X axis instead.
+ *   - sendPhase, plantGroup, recenterLegs all switch between
+ *     legs[] and crabLegs[] depending on crabMode.
+ *   - adjustHeight() updates both leg arrays simultaneously so
+ *     height changes work in any mode.
+ *   - g1 activates crab mode;  g0/g2/g3 deactivate it.
+ *     In crab mode:  F/B = forward/backward,  L/R = strafe.
+ *   - g2 activates diagonal walk mode; g0/g1/g3 deactivate it.
+ *     In diagonal walk mode, the bot walks diagonally instead of straight.
  *
  * ── COMMAND REFERENCE ────────────────────────────────────────
- *   F / B          walk forward / backward
- *   L / R          arc turn left / right
+ *   F / B          walk forward / backward  (or crab F/B)
+ *   L / R          arc turn left / right    (or crab strafe)
  *   W / X          rotate left / right (spin in place)
  *   A              sitting position
  *   Z              sleeping position
  *   U / D          raise / lower body height
  *   S              stop / stand still
  *   + / -          speed up / slow down
- *   g0             Tripod Walk  (default)
- *   g1             Crab Walk
- *   g2             Diagonal Walk
- *   g3             Wave Gait
+ *   g0             Tripod Walk   (crab mode OFF)
+ *   g1             Crab Walk     (crab mode ON  — F/B/L/R remapped)
+ *   g2             Diagonal Walk (crab mode OFF)
+ *   g3             Wave Gait     (crab mode OFF)
  *   jFWD,TURN      joystick  e.g. j66,33 or j0,50
  *   ?              status report
+ *
+ * ── BT APP SETUP (Serial Bluetooth Terminal) ─────────────────
+ *   Settings → Line ending → Newline (\n)
  *===============================================================*/
 
 #include <Arduino.h>
@@ -65,23 +64,23 @@
 //  SECTION 1 — HARDWARE, CONSTANTS, LEG DATA
 // ───────────────────────────────────────────────────────────────
 
-HardwareSerial       LSC(2);            // UART2 → LSC-32  (RX=16, TX=17)
+HardwareSerial       LSC(2);
 BluetoothSerial      SerialBT;
-LobotServoController controller(LSC);  // battery voltage polling
+LobotServoController controller(LSC);
 
 // ── Leg geometry (cm) ─────────────────────────────────────────
-const float COXA   = 6.0f;   // hip segment
-const float FEMUR  = 8.5f;   // upper leg
-const float TIBIA  = 14.5f;  // lower leg
-const float LIFT_H = 3.0f;   // foot lift height per step
+const float COXA   = 6.0f;
+const float FEMUR  = 8.5f;
+const float TIBIA  = 14.5f;
+const float LIFT_H = 3.0f;
 
 // ── Servo pulse constants ──────────────────────────────────────
-const int   SERVO_MID = 1500;    // 90 ° in microseconds
-const float DEG_TO_US = 11.11f;  // µs per degree
+const int   SERVO_MID = 1500;
+const float DEG_TO_US = 11.11f;
 
 // ── Runtime-tunable parameters ────────────────────────────────
-uint16_t moveTime = 500;    // ms per gait phase  (lower = faster)
-float    bodyZ    = -9.0f;  // body height  (more negative = lower)
+uint16_t moveTime = 500;
+float    bodyZ    = -9.0f;
 
 const uint16_t SPEED_MIN  = 150;
 const uint16_t SPEED_MAX  = 1000;
@@ -96,6 +95,7 @@ bool          btConnected        = false;
 float         voltageInVolts     = 0.0f;
 unsigned long lastVoltageRequest = 0;
 const char*   lastCmdName        = "NONE";
+bool          crabMode           = false;
 
 // ── Logging helpers ────────────────────────────────────────────
 void btLog(const char* msg) { SerialBT.print(msg);    Serial.print(msg);    }
@@ -103,13 +103,6 @@ void btLog(int          num) { SerialBT.print(num);    Serial.print(num);    }
 void btLog(float        num) { SerialBT.print(num, 2); Serial.print(num, 2); }
 
 // ── Leg data structure ─────────────────────────────────────────
-//   id          — LSC-32 base servo ID  (coxa=id, femur=id+1, tibia=id+2)
-//   restX       — outward reach (cm)
-//   walkY       — neutral Y for forward/backward steps
-//   rotY        — neutral Y for rotate-in-place  (0 = symmetric)
-//   restZ       — standing height; updated live by adjustHeight()
-//   coxaDir     — +1 = left side,  -1 = right side
-//   strideScale — 45 ° mounts use 1.41; horizontal mounts use 1.0
 struct Leg {
   uint8_t id;
   float   restX, walkY, rotY, restZ;
@@ -117,6 +110,7 @@ struct Leg {
   float   strideScale;
 };
 
+// Normal walking stance — legs point outward like a spider.
 //            id    X  walkY  rotY    Z   dir  scale
 Leg legs[6] = {
   {  0,  10,   3,    0,   -9,  +1,  1.0f },  // 0  Front-Left
@@ -127,6 +121,18 @@ Leg legs[6] = {
   { 26,  10,   6,    0,   -9,  -1,  1.0f },  // 5  Rear-Right
 };
 
+// Crab stance — legs rotated to face sideways.
+// walkY values are tuned so all legs point toward the same wall.
+// rotY mirrors walkY so standStill() homes correctly in crab mode.
+Leg crabLegs[6] = {
+  {  0,  10,   8,   8,   -8,  +1,  1.0f },  // 0  Front-Left
+  {  3,  10,   0,   0,   -8,  +1,  1.0f },  // 1  Mid-Left
+  { 29,  10,  -8,  -8,   -8,  +1,  1.0f },  // 2  Rear-Left
+  {  6,  10,  -8,  -8,   -8,  -1,  1.0f },  // 3  Front-Right
+  {  9,  10,   0,   0,   -8,  -1,  1.0f },  // 4  Mid-Right
+  { 26,  10,   8,   8,   -8,  -1,  1.0f },  // 5  Rear-Right
+};
+
 // Tripod groups — two stable triangles that alternate every half-cycle.
 const int GRP_A[3] = { 0, 2, 4 };  // Front-Left, Rear-Left,   Mid-Right
 const int GRP_B[3] = { 1, 3, 5 };  // Mid-Left,   Front-Right, Rear-Right
@@ -134,9 +140,6 @@ const int GRP_B[3] = { 1, 3, 5 };  // Mid-Left,   Front-Right, Rear-Right
 
 // ───────────────────────────────────────────────────────────────
 //  SECTION 2 — IK SOLVER
-//
-//  Input : foot position (X, Y, Z in cm) + move duration (ms)
-//  Output: 16-byte LSC-32 packet — moves all 3 leg servos at once
 // ───────────────────────────────────────────────────────────────
 void moveFootXYZ(uint8_t id, float x, float y, float z, uint16_t t) {
 
@@ -153,9 +156,9 @@ void moveFootXYZ(uint8_t id, float x, float y, float z, uint16_t t) {
   float femurAngle = atan2(z, R) + acos(constrain(
     (FEMUR*FEMUR + D*D - TIBIA*TIBIA) / (2*FEMUR*D), -1.0f, 1.0f));
 
-  float cDeg = coxaAngle  * 180.0f / PI;
-  float fDeg = femurAngle * 180.0f / PI;
-  float tDeg = 180.0f - (tibiaAngle * 180.0f / PI);
+  float cDeg = coxaAngle  * 57.2957795f;
+  float fDeg = femurAngle * 57.2957795f;
+  float tDeg = 180.0f - (tibiaAngle * 57.2957795f);
 
   uint16_t p1 = constrain((int)(SERVO_MID +  cDeg          * DEG_TO_US), 500, 2500);
   uint16_t p2 = constrain((int)(SERVO_MID + (fDeg - 90.0f) * DEG_TO_US), 500, 2500);
@@ -173,54 +176,72 @@ void moveFootXYZ(uint8_t id, float x, float y, float z, uint16_t t) {
 
 
 // ───────────────────────────────────────────────────────────────
-//  SECTION 3 — GAIT SHAPES  (plug-and-play)
+//  SECTION 3 — GAIT SHAPES  (plug-and-play, 2-D)
 //
-//  swingY(i) → target Y when the foot lifts and steps
-//  dragY(i)  → target Y when the foot pushes the body
+//  V2.7 extends each gait with X-axis functions (swingX / dragX).
+//  Normal gaits return restX unchanged — only crab left/right
+//  drive the X axis.  swingY / dragY work exactly as in V2.6.
 //
-//  The engine scales the offset from walkY by finalScale, which
-//  is derived from jFwd and jTurn — so the same shape functions
-//  serve forward, backward, arc, and spin automatically.
+//  GaitDef now holds four function pointers:
+//    swingX(i), dragX(i)  — X target for swing / drag
+//    swingY(i), dragY(i)  — Y target for swing / drag
 //
-//  To add a gait: write a pair of functions, add one row to
-//  GAIT_TABLE[].  No engine code changes required.
+//  The engine resolves the correct leg struct (legs[] or
+//  crabLegs[]) at runtime based on crabMode.
 // ───────────────────────────────────────────────────────────────
 
-// Gait 0 — Tripod Walk
-float tripodSwing(int i){ return legs[i].walkY - (3.0f * legs[i].coxaDir * legs[i].strideScale); }
-float tripodDrag (int i){ return legs[i].walkY + (3.0f * legs[i].coxaDir * legs[i].strideScale); }
+// ── Neutral X helpers (most gaits don't move X) ───────────────
+float defaultX   (int i){ return legs[i].restX;     }
+float defaultCrabX(int i){ return crabLegs[i].restX; }
 
-// Gait 1 — Crab Walk  (sideways shuffle)
-float crabSwing(int i){ return legs[i].restX + 1.5f; }
-float crabDrag (int i){ return legs[i].restX - 3.0f; }
+// ── Neutral Y helpers ─────────────────────────────────────────
+float defaultY   (int i){ return legs[i].walkY;     }
+float defaultCrabY(int i){ return crabLegs[i].walkY; }
 
-// Gait 2 — Diagonal Walk
-float diagSwing(int i){
-  float bias = (i <= 1) ? 2.0f : (i <= 3) ? 0.0f : -2.0f;
-  return legs[i].walkY - (3.0f * legs[i].coxaDir * legs[i].strideScale) + bias;
-}
-float diagDrag(int i){
-  float bias = (i <= 1) ? 2.0f : (i <= 3) ? 0.0f : -2.0f;
-  return legs[i].walkY + (3.0f * legs[i].coxaDir * legs[i].strideScale) - bias;
-}
+// ── Gait 0 — Tripod Walk ──────────────────────────────────────
+float tripodSwingY(int i){ return legs[i].walkY - (3.0f * legs[i].coxaDir * legs[i].strideScale); }
+float tripodDragY (int i){ return legs[i].walkY + (3.0f * legs[i].coxaDir * legs[i].strideScale); }
 
-// Gait 3 — Wave Gait  (5 legs grounded at all times)
-float waveSwing(int i){
+// ── Gait 1 — Crab Walk  (unified 2-D: Y + X) ────────────────
+// Uses crabLegs[].  Y driven by jFwd, X driven by jStrafe.
+//   jFwd    = +1/−1  →  forward / backward
+//   jStrafe = +1/−1  →  strafe left / right
+float crabSwingY(int i){ return crabLegs[i].walkY - (3.0f * crabLegs[i].coxaDir * crabLegs[i].strideScale); }
+float crabDragY (int i){ return crabLegs[i].walkY + (3.0f * crabLegs[i].coxaDir * crabLegs[i].strideScale); }
+float crabSwingX(int i){ return crabLegs[i].restX - (3.0f * crabLegs[i].coxaDir * crabLegs[i].strideScale); }
+float crabDragX (int i){ return crabLegs[i].restX + (3.0f * crabLegs[i].coxaDir * crabLegs[i].strideScale); }
+
+// ── Walk X stride (normal legs, for diagonal walk) ────────────
+float walkSwingX(int i){ return legs[i].restX - (3.0f * legs[i].coxaDir * legs[i].strideScale); }
+float walkDragX (int i){ return legs[i].restX + (3.0f * legs[i].coxaDir * legs[i].strideScale); }
+
+// ── Gait 3 — Wave Gait ────────────────────────────────────────
+float waveSwingY(int i){
   float extra = (i % 3) * 0.5f;
   return legs[i].walkY - (2.0f + extra) * legs[i].coxaDir * legs[i].strideScale;
 }
-float waveDrag(int i){
+float waveDragY(int i){
   float extra = (i % 3) * 0.5f;
   return legs[i].walkY + (2.0f + extra) * legs[i].coxaDir * legs[i].strideScale;
 }
 
-struct GaitDef { const char* name; float(*swingY)(int); float(*dragY)(int); };
+// ── Gait table ─────────────────────────────────────────────────
+//  Each row: name, swingX, dragX, swingY, dragY, indepXY
+//  indepXY = true  →  X scaled by jStrafe, Y scaled by jFwd  (2-D)
+//  indepXY = false →  both axes use finalScale = jFwd + jTurn×coxaDir
+struct GaitDef {
+  const char* name;
+  float(*swingX)(int);  float(*dragX)(int);
+  float(*swingY)(int);  float(*dragY)(int);
+  bool indepXY;         // true = independent X/Y scaling
+};
 
 GaitDef GAIT_TABLE[] = {
-  { "Tripod Walk",   tripodSwing, tripodDrag },  // 0
-  { "Crab Walk",     crabSwing,   crabDrag   },  // 1
-  { "Diagonal Walk", diagSwing,   diagDrag   },  // 2
-  { "Wave Gait",     waveSwing,   waveDrag   },  // 3
+  // idx  name               swingX         dragX          swingY          dragY         indep
+  {  "Tripod Walk",    defaultX,      defaultX,      tripodSwingY,   tripodDragY,   false },  // 0
+  {  "Crab Walk",      crabSwingX,    crabDragX,     crabSwingY,     crabDragY,     true  },  // 1
+  {  "Diagonal Walk",  walkSwingX,    walkDragX,     tripodSwingY,   tripodDragY,   true  },  // 2
+  {  "Wave Gait",      defaultX,      defaultX,      waveSwingY,     waveDragY,     false },  // 3
 };
 const uint8_t GAIT_COUNT = sizeof(GAIT_TABLE) / sizeof(GAIT_TABLE[0]);
 
@@ -253,28 +274,26 @@ void queueClear() { qHead = qTail = qCount = 0; }
 
 
 // ───────────────────────────────────────────────────────────────
-//  SECTION 5 — NON-BLOCKING GAIT ENGINE
+//  SECTION 5 — NON-BLOCKING 2-D GAIT ENGINE
 //
-//  Five phases per full step cycle:
-//   SEND_A   — Group A lifts + steps;  Group B drags on ground
-//   PLANT_A  — wait moveTime ms, press Group A to floor
-//   SEND_B   — Group B lifts + steps;  Group A drags on ground
-//   PLANT_B  — wait moveTime ms, press Group B to floor
-//   RECENTER — all legs return to walkY, then loop or stop
+//  Same five-phase structure as V2.6 (SEND_A → PLANT_A →
+//  SEND_B → PLANT_B → RECENTER).
 //
-//  ── Differential drive mixing ────────────────────────────────
-//    finalScale = constrain( jFwd + (jTurn × coxaDir) , -1, 1 )
-//
-//    Examples (jFwd, jTurn → left scale, right scale):
-//      1.0,  0.0  → +1.0, +1.0  full forward
-//     -1.0,  0.0  → -1.0, -1.0  full backward
-//      0.66,-0.33 → +0.33,+1.0  arc left  (3:1 stride ratio)
-//      0.0, -1.0  → -1.0, +1.0  rotate left
-//      0.0, +1.0  → +1.0, -1.0  rotate right
+//  V2.7 additions:
+//  • sendPhase / plantGroup resolve the active leg struct with:
+//      Leg& leg = crabMode ? crabLegs[idx] : legs[idx];
+//  • Normal mode: single finalScale = jFwd + jTurn×coxaDir
+//    drives both X and Y identically (differential walk+turn).
+//  • Crab mode: X and Y have independent scales:
+//      scaleY = jFwd          (forward / backward)
+//      scaleX = jStrafe       (strafe left / right)
+//    This enables true omnidirectional crab movement.
+//  • recenterLegs() homes to the correct walkY for each mode.
 // ───────────────────────────────────────────────────────────────
 
-float jFwd  = 0.0f;
-float jTurn = 0.0f;
+float jFwd    = 0.0f;
+float jTurn   = 0.0f;
+float jStrafe = 0.0f;   // independent X-axis scale (used when gait has indepXY)
 
 enum GaitPhase { IDLE, SEND_A, PLANT_A, SEND_B, PLANT_B, RECENTER };
 GaitPhase     gaitPhase  = IDLE;
@@ -289,17 +308,25 @@ void sendPhase(bool groupASwings) {
   const int* dragGrp  = groupASwings ? GRP_B : GRP_A;
 
   for (int i = 0; i < 3; i++) {
-    int   idx        = swingGrp[i];
-    float finalScale = constrain(jFwd + (jTurn * legs[idx].coxaDir), -1.0f, 1.0f);
-    float stepY      = legs[idx].walkY + (g.swingY(idx) - legs[idx].walkY) * finalScale;
-    moveFootXYZ(legs[idx].id, legs[idx].restX, stepY, legs[idx].restZ - LIFT_H, moveTime);
+    int   idx   = swingGrp[i];
+    Leg&  leg   = crabMode ? crabLegs[idx] : legs[idx];
+    float scaleY = g.indepXY ? jFwd
+                             : constrain(jFwd + (jTurn * leg.coxaDir), -1.0f, 1.0f);
+    float scaleX = g.indepXY ? jStrafe : scaleY;
+    float stepX  = leg.restX + (g.swingX(idx) - leg.restX) * scaleX;
+    float stepY  = leg.walkY + (g.swingY(idx) - leg.walkY) * scaleY;
+    moveFootXYZ(leg.id, stepX, stepY, leg.restZ - LIFT_H, moveTime);
   }
 
   for (int i = 0; i < 3; i++) {
-    int   idx        = dragGrp[i];
-    float finalScale = constrain(jFwd + (jTurn * legs[idx].coxaDir), -1.0f, 1.0f);
-    float slideY     = legs[idx].walkY + (g.dragY(idx) - legs[idx].walkY) * finalScale;
-    moveFootXYZ(legs[idx].id, legs[idx].restX, slideY, legs[idx].restZ, moveTime);
+    int   idx   = dragGrp[i];
+    Leg&  leg   = crabMode ? crabLegs[idx] : legs[idx];
+    float scaleY = g.indepXY ? jFwd
+                             : constrain(jFwd + (jTurn * leg.coxaDir), -1.0f, 1.0f);
+    float scaleX = g.indepXY ? jStrafe : scaleY;
+    float slideX = leg.restX + (g.dragX(idx) - leg.restX) * scaleX;
+    float slideY = leg.walkY + (g.dragY(idx) - leg.walkY) * scaleY;
+    moveFootXYZ(leg.id, slideX, slideY, leg.restZ, moveTime);
   }
 }
 
@@ -308,16 +335,22 @@ void plantGroup(bool groupA) {
   const int* grp = groupA ? GRP_A : GRP_B;
 
   for (int i = 0; i < 3; i++) {
-    int   idx        = grp[i];
-    float finalScale = constrain(jFwd + (jTurn * legs[idx].coxaDir), -1.0f, 1.0f);
-    float plantY     = legs[idx].walkY + (g.swingY(idx) - legs[idx].walkY) * finalScale;
-    moveFootXYZ(legs[idx].id, legs[idx].restX, plantY, legs[idx].restZ, moveTime / 3);
+    int   idx   = grp[i];
+    Leg&  leg   = crabMode ? crabLegs[idx] : legs[idx];
+    float scaleY = g.indepXY ? jFwd
+                             : constrain(jFwd + (jTurn * leg.coxaDir), -1.0f, 1.0f);
+    float scaleX = g.indepXY ? jStrafe : scaleY;
+    float plantX = leg.restX + (g.swingX(idx) - leg.restX) * scaleX;
+    float plantY = leg.walkY + (g.swingY(idx) - leg.walkY) * scaleY;
+    moveFootXYZ(leg.id, plantX, plantY, leg.restZ, moveTime / 3);
   }
 }
 
 void recenterLegs() {
-  for (int i = 0; i < 6; i++)
-    moveFootXYZ(legs[i].id, legs[i].restX, legs[i].walkY, legs[i].restZ, moveTime / 2);
+  for (int i = 0; i < 6; i++) {
+    Leg& leg = crabMode ? crabLegs[i] : legs[i];
+    moveFootXYZ(leg.id, leg.restX, leg.walkY, leg.restZ, moveTime / 2);
+  }
 }
 
 void startGait(bool continuous) {
@@ -389,33 +422,33 @@ void gaitTick() {
 // ───────────────────────────────────────────────────────────────
 //  SECTION 6 — MOVEMENT FUNCTIONS
 //
-//  All motion uses Gait 0 (Tripod).  Direction and turn radius
-//  are fully controlled by jFwd and jTurn via the differential
-//  mixing formula — no separate gait indices for turns/rotation.
+//  Normal mode (crabMode=false):
+//    F/B = tripod walk,  L/R = arc turn,  W/X = rotate
 //
-//  jFwd / jTurn quick-reference:
-//    walkForward    1.0,  0.0
-//    walkBackward  -1.0,  0.0
-//    turnLeft       0.66, -0.33  → 3:1 outer/inner stride ratio
-//    turnRight      0.66,  0.33
-//    rotateLeft     0.0,  -1.0   → pure spin
-//    rotateRight    0.0,   1.0
+//  Crab mode (crabMode=true, activated by g1):
+//    F   = crab forward  (gait 1)
+//    B   = crab backward (gait 4)
+//    L   = strafe left   (gait 5)
+//    R   = strafe right  (gait 6)
+//    W/X = rotate (unchanged — always uses tripod differential)
 // ───────────────────────────────────────────────────────────────
 
 void standStill() {
   stopGait();
   queueClear();
-  jFwd = jTurn = 0.0f;
-  activeGait   = 0;
-  for (int i = 0; i < 6; i++)
-    moveFootXYZ(legs[i].id, legs[i].restX, legs[i].rotY, legs[i].restZ, moveTime);
+  jFwd = jTurn = jStrafe = 0.0f;
+  activeGait = 0;
+  for (int i = 0; i < 6; i++) {
+    Leg& leg = crabMode ? crabLegs[i] : legs[i];
+    moveFootXYZ(leg.id, leg.restX, leg.rotY, leg.restZ, moveTime);
+  }
 }
 
 void sittingLegs() {
   stopGait();
   queueClear();
-  jFwd = jTurn = 0.0f;
-  activeGait   = 0;
+  jFwd = jTurn = jStrafe = 0.0f;
+  activeGait = 0;
   for (int i = 0; i < 6; i++)
     moveFootXYZ(legs[i].id, legs[i].restX, legs[i].walkY, legs[i].restZ - 3, 2000);
 }
@@ -423,12 +456,13 @@ void sittingLegs() {
 void sleepingLegs() {
   stopGait();
   queueClear();
-  jFwd = jTurn = 0.0f;
-  activeGait   = 0;
+  jFwd = jTurn = jStrafe = 0.0f;
+  activeGait = 0;
   for (int i = 0; i < 1; i++)
     moveFootXYZ(legs[i].id, legs[i].restX, legs[i].walkY + 12, legs[i].restZ - 3, 2000);
 }
 
+// Normal tripod movement
 void walkForward()  { activeGait = 0; jFwd =  1.0f;  jTurn =  0.0f;  startGait(true); }
 void walkBackward() { activeGait = 0; jFwd = -1.0f;  jTurn =  0.0f;  startGait(true); }
 void turnLeft()     { activeGait = 0; jFwd =  0.66f; jTurn = -0.33f; startGait(true); }
@@ -436,9 +470,16 @@ void turnRight()    { activeGait = 0; jFwd =  0.66f; jTurn =  0.33f; startGait(t
 void rotateLeft()   { activeGait = 0; jFwd =  0.0f;  jTurn = -1.0f;  startGait(true); }
 void rotateRight()  { activeGait = 0; jFwd =  0.0f;  jTurn =  1.0f;  startGait(true); }
 
+// Crab movement — unified gait 1.  jFwd drives Y, jStrafe drives X.
+void crabForward()  { activeGait = 1; jFwd =  1.0f; jStrafe =  0.0f; jTurn = 0.0f; startGait(true); }
+void crabBackward() { activeGait = 1; jFwd = -1.0f; jStrafe =  0.0f; jTurn = 0.0f; startGait(true); }
+void crabLeft()     { activeGait = 1; jFwd =  0.0f; jStrafe =  1.0f; jTurn = 0.0f; startGait(true); }
+void crabRight()    { activeGait = 1; jFwd =  0.0f; jStrafe = -1.0f; jTurn = 0.0f; startGait(true); }
+
 
 // ───────────────────────────────────────────────────────────────
 //  SECTION 7 — HEIGHT CONTROL
+//  Updates both legs[] and crabLegs[] so height works in any mode.
 // ───────────────────────────────────────────────────────────────
 
 void adjustHeight(float delta) {
@@ -448,7 +489,10 @@ void adjustHeight(float delta) {
     return;
   }
   bodyZ = newZ;
-  for (int i = 0; i < 6; i++) legs[i].restZ = bodyZ;
+  for (int i = 0; i < 6; i++) {
+    legs[i].restZ     = bodyZ;
+    crabLegs[i].restZ = bodyZ;
+  }
   standStill();
   char buf[32]; snprintf(buf, sizeof(buf), ">> Height: %.1f cm\n", bodyZ); btLog(buf);
 }
@@ -467,28 +511,40 @@ void handleCommand(char cmd) {
   switch (cmd) {
 
     case 'F': case 'f':
-      lastCmdName = "FORWARD";   btLog(">> walkForward\n");  walkForward();  break;
+      lastCmdName = "FORWARD";
+      if (crabMode) { btLog(">> crabForward\n");  crabForward();  }
+      else          { btLog(">> walkForward\n");   walkForward();  }
+      break;
 
     case 'B': case 'b':
-      lastCmdName = "BACKWARD";  btLog(">> walkBackward\n"); walkBackward(); break;
+      lastCmdName = "BACKWARD";
+      if (crabMode) { btLog(">> crabBackward\n"); crabBackward(); }
+      else          { btLog(">> walkBackward\n");  walkBackward(); }
+      break;
 
     case 'L': case 'l':
-      lastCmdName = "TURN LEFT"; btLog(">> turnLeft\n");     turnLeft();     break;
+      lastCmdName = "LEFT";
+      if (crabMode) { btLog(">> crabLeft\n");     crabLeft();     }
+      else          { btLog(">> turnLeft\n");      turnLeft();     }
+      break;
 
     case 'R': case 'r':
-      lastCmdName = "TURN RIGHT";btLog(">> turnRight\n");    turnRight();    break;
+      lastCmdName = "RIGHT";
+      if (crabMode) { btLog(">> crabRight\n");    crabRight();    }
+      else          { btLog(">> turnRight\n");     turnRight();    }
+      break;
 
     case 'W': case 'w':
-      lastCmdName = "ROT LEFT";  btLog(">> rotateLeft\n");   rotateLeft();   break;
+      lastCmdName = "ROT LEFT";  btLog(">> rotateLeft\n");  rotateLeft();  break;
 
     case 'X': case 'x':
-      lastCmdName = "ROT RIGHT"; btLog(">> rotateRight\n");  rotateRight();  break;
+      lastCmdName = "ROT RIGHT"; btLog(">> rotateRight\n"); rotateRight(); break;
 
     case 'A': case 'a':
-      lastCmdName = "SITTING";   btLog(">> sittingLegs\n");  sittingLegs();  break;
+      lastCmdName = "SITTING";   btLog(">> sittingLegs\n"); sittingLegs(); break;
 
     case 'Z': case 'z':
-      lastCmdName = "SLEEPING";  btLog(">> sleepingLegs\n"); sleepingLegs(); break;
+      lastCmdName = "SLEEPING";  btLog(">> sleepingLegs\n");sleepingLegs();break;
 
     case 'U': case 'u':
       lastCmdName = "HEIGHT UP"; increaseHeight(); break;
@@ -510,14 +566,16 @@ void handleCommand(char cmd) {
       break;
 
     case '?':
-      btLog("─── SpiderBot V2.6 ───\n");
+      btLog("─── SpiderBot V2.7 ───\n");
       btLog("Last cmd : "); btLog(lastCmdName);                  btLog("\n");
       btLog("Gait     : "); btLog(GAIT_TABLE[activeGait].name);  btLog("\n");
+      btLog("Crab mode: "); btLog(crabMode ? "ON\n" : "OFF\n");
       btLog("Speed    : "); btLog(moveTime);   btLog(" ms\n");
       btLog("Height   : "); btLog(bodyZ);      btLog(" cm\n");
       btLog("Battery  : "); btLog(voltageInVolts); btLog(" V\n");
       btLog("jFwd     : "); btLog(jFwd);
-      btLog("  jTurn  : "); btLog(jTurn);      btLog("\n");
+      btLog("  jTurn  : "); btLog(jTurn);
+      btLog("  jStrafe: "); btLog(jStrafe);    btLog("\n");
       btLog("Queue    : "); btLog(qCount);     btLog(" waiting\n");
       btLog("──────────────────────\n");
       break;
@@ -534,26 +592,40 @@ void parseInput(char c) {
     if (first == 'j' || first == 'J') {
       int comma = inputBuffer.indexOf(',');
       if (comma > 1) {
-        jFwd  = constrain(inputBuffer.substring(1, comma).toFloat() / 100.0f, -1.0f, 1.0f);
-        jTurn = constrain(inputBuffer.substring(comma + 1).toFloat() / 100.0f, -1.0f, 1.0f);
+        float rawFwd  = constrain(inputBuffer.substring(1, comma).toFloat() / 100.0f, -1.0f, 1.0f);
+        float rawTurn = constrain(inputBuffer.substring(comma + 1).toFloat() / 100.0f, -1.0f, 1.0f);
 
-        // Speed scales with vector magnitude of both inputs
-        float mag = constrain(sqrt(jFwd*jFwd + jTurn*jTurn), 0.0f, 1.0f);
+        float mag = constrain(sqrt(rawFwd*rawFwd + rawTurn*rawTurn), 0.0f, 1.0f);
         moveTime  = (uint16_t)map((long)(mag * 100), 0, 100, SPEED_MAX, SPEED_MIN);
-
         lastCmdName = "JOYSTICK";
-        activeGait  = 0;
 
-        if (fabsf(jFwd) < 0.05f && fabsf(jTurn) < 0.05f) standStill();
+        if (GAIT_TABLE[activeGait].indepXY) {
+          // 2-D gait (crab or diagonal): jFwd drives Y, jStrafe drives X
+          jFwd    = rawFwd;
+          jStrafe = -rawTurn;     // sign flip: right stick = right strafe
+          jTurn   = 0.0f;
+        } else {
+          activeGait = 0;
+          jFwd    = rawFwd;
+          jTurn   = rawTurn;
+          jStrafe = 0.0f;
+        }
+
+        if (fabsf(rawFwd) < 0.05f && fabsf(rawTurn) < 0.05f) standStill();
         else startGait(true);
       }
     }
     else if (first == 'g' || first == 'G') {
+      // g0…g3 are user-selectable.  g1 activates crab mode.
       uint8_t idx = (uint8_t)inputBuffer.substring(1).toInt();
-      if (idx < GAIT_COUNT) {
+      if (idx <= 3) {
+        crabMode   = (idx == 1);
         activeGait = idx;
         jFwd = 1.0f; jTurn = 0.0f;
-        char buf[40]; snprintf(buf, sizeof(buf), ">> Gait: %s\n", GAIT_TABLE[idx].name);
+        char buf[56];
+        snprintf(buf, sizeof(buf), ">> Gait: %s%s\n",
+                 GAIT_TABLE[idx].name,
+                 crabMode ? "  (F/B=fwd-back  L/R=strafe)" : "");
         btLog(buf);
       } else {
         btLog(">> Bad gait number. Use g0, g1, g2 or g3.\n");
@@ -576,10 +648,11 @@ void parseInput(char c) {
 void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
   if (event == ESP_SPP_SRV_OPEN_EVT) {
     btConnected = true;
-    btLog("SpiderBot V2.6 Ready!\n");
+    btLog("SpiderBot V2.7 Ready!\n");
     btLog("F/B=walk  L/R=turn  W/X=rotate  A=sit  Z=sleep\n");
     btLog("U/D=height  S=stop  +/-=speed  ?=status\n");
     btLog("g0=tripod  g1=crab  g2=diagonal  g3=wave\n");
+    btLog("In crab mode: F/B=fwd-back  L/R=strafe\n");
     btLog("j66,33=arc left  j0,50=spin  j100,0=full fwd\n");
   }
   if (event == ESP_SPP_CLOSE_EVT) {
@@ -599,7 +672,7 @@ void setup() {
   SerialBT.register_callback(btCallback);
   delay(1000);
   SerialBT.begin("SpiderBot");
-  Serial.println("SpiderBot V2.6 — pair your phone with: SpiderBot");
+  Serial.println("SpiderBot V2.7 — pair your phone with: SpiderBot");
   delay(2000);
   standStill();
 }

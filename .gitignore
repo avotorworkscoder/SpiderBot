@@ -1,0 +1,8 @@
+# Ignored Python environments and caches
+venv/
+__pycache__/
+
+# Requested project ignores
+Resume.md
+hexapod/
+UpdateClaudeContext.py

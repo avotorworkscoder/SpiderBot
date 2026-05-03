@@ -21,11 +21,9 @@ void loop() {
   //moveServoHex(0, 2500, 1000); 
   //delay(2000);
 
-  moveServoHex(26, 1500, 1000); 
+  moveServoHex(0, 500, 1000); 
 
-  moveServoHex(27, 500, 1000); 
-
-  moveServoHex(28, 1500, 1000); 
+  
 
   // 2. Move Servo 1 to Position 1000 in 1000ms
   //moveServoHex(0, 500, 1000); 
