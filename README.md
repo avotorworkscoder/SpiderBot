@@ -134,7 +134,7 @@ SpiderBot uses a hybrid geometric Inverse Kinematics (IK) solver and a parametri
 
 ### 1. Inverse Kinematics (3-DOF)
 Each leg calculates the required angles ($\alpha, \beta, \gamma$) based on the target coordinate $(x, y, z)$.
-- **Coxa Angle**: $\theta_{coxa} = \operatorname{atan2}(y, x)$
+- **Coxa Angle**: $\theta_{coxa} = \text{atan2}(y, x)$
 - **Femur/Tibia Calculation**: Uses the **Law of Cosines** on the triangle formed by the Femur and Tibia segments to find the relative joint angles based on the 2D distance $D = \sqrt{x^2 + y^2} - L_{coxa}$.
 
 ### 2. Phase-Continuous Bézier Trajectories
@@ -167,7 +167,7 @@ Contributions are welcome! If you have ideas for new gaits, sensor integrations,
 5. Open a Pull Request.
 
 ## 📄 License
-Distributed under the MIT License. See `LICENSE` for more information.
+Distributed under the APACHE 2.0 License. See `LICENSE` for more information.
 
 ---
 
